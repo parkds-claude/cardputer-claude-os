@@ -80,7 +80,7 @@ that backup never exists for these users.
 
 ## Prerequisites
 
-You need **Python 3.10+**, **git**, and **Claude Code** on your laptop. `esptool` and `pyserial` ship vendored inside `onboard/scripts/vendor/`, so there's no pip-install step.
+You need **Python 3.10+**, **git**, and **Claude Code** on your laptop. `pyserial` ships vendored inside `onboard/scripts/vendor/`. `esptool` is GPL-licensed and is **not** vendored — the skill auto-installs it via pip on first run if it isn't already in your environment, so the user-facing experience is still a single command. To pre-install explicitly: `python3 -m pip install --user -r requirements.txt`.
 
 Bootstrap if needed:
 - **macOS** — `python3` usually pre-installed; if not, `brew install python`
@@ -113,4 +113,4 @@ The two are decoupled by design: `onboard` can install any bundle via `--apps <p
 
 This project's own code is licensed under **Apache 2.0** — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 
-Bundled third-party packages in `onboard/scripts/vendor/` retain their upstream licenses. Most are permissive (MIT / BSD / Apache 2.0); **`esptool` is GPLv2+** and is invoked only as a subprocess. See [`LICENSE-THIRD-PARTY.md`](LICENSE-THIRD-PARTY.md) for the full inventory.
+`pyserial` (BSD-3-Clause, Apache-compatible) is the only third-party package bundled in `onboard/scripts/vendor/`. `esptool` (GPLv2+) is intentionally not vendored; it's declared as a pip dependency in [`requirements.txt`](requirements.txt) so the repository itself stays cleanly Apache-2.0. See [`LICENSE-THIRD-PARTY.md`](LICENSE-THIRD-PARTY.md) for details.

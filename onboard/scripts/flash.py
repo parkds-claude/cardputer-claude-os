@@ -31,6 +31,7 @@ sections, so we just write the whole blob to offset 0.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import subprocess
 import sys
 
@@ -49,17 +50,19 @@ NATIVE_BAUD = 115200
 def _esptool_cmd():
     """Build the base command to invoke esptool.
 
-    We prefer the vendored copy: ``python -m esptool`` via the
-    current interpreter, with ``vendor/`` on PYTHONPATH. This
-    sidesteps the whole "where's the esptool binary on $PATH"
-    question on every OS and guarantees we're using the pinned
-    version we tested against.
+    Prefer ``python -m esptool`` via the current interpreter — that
+    works whether esptool was pip-installed in the user/system
+    site-packages (the standard install path; esptool is GPLv2+ and
+    is intentionally not vendored) or, hypothetically, sitting in
+    sys.path some other way. Subprocesses inherit user-site by
+    default so the import resolves.
 
-    If the vendor dir is missing (someone pruned it), fall back
-    to the pre-vendor behavior: hunt ``esptool`` on ``$PATH`` and
-    user-install dirs via ``detect.find_esptool``.
+    Only fall back to hunting the binary on ``$PATH`` / common
+    user-install dirs when the importable module isn't found —
+    rare, but covers a pip-install that landed in Scripts/ without
+    a corresponding site-packages entry.
     """
-    if vendor_path.is_available():
+    if importlib.util.find_spec("esptool") is not None:
         return [sys.executable, "-m", "esptool"]
     return [find_esptool()]
 

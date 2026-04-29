@@ -2,45 +2,32 @@
 
 This project's own source code (everything outside `onboard/scripts/vendor/`) is licensed under the Apache License, Version 2.0 — see [`LICENSE`](LICENSE).
 
-Vendored Python packages under `onboard/scripts/vendor/` retain their upstream licenses, summarized below. The full license text for each package is preserved alongside its source in the corresponding `*.dist-info/` directory.
+The repository ships exactly one third-party Python package, vendored under `onboard/scripts/vendor/`. It retains its upstream license; the full license text is preserved alongside the source in the corresponding `*.dist-info/` directory.
 
 ## Inventory
 
 | Package | Version | License | Source |
 |---|---|---|---|
-| esptool | 4.11.0 | **GPLv2+** | https://github.com/espressif/esptool |
 | pyserial | 3.5 | BSD-3-Clause | https://github.com/pyserial/pyserial |
-| ecdsa | 0.19.2 | MIT | https://github.com/tlsfuzzer/python-ecdsa |
-| bitstring | 4.4.0 | MIT | https://github.com/scott-griffiths/bitstring |
-| intelhex | 2.3.0 | BSD | https://github.com/bialix/intelhex |
-| pycparser | 3.0 | BSD-3-Clause | https://github.com/eliben/pycparser |
-| reedsolo | 1.7.0 | Unlicense (public domain) | https://github.com/lrq3000/reedsolomon |
-| six | 1.17.0 | MIT | https://github.com/benjaminp/six |
-| argcomplete | 3.6.3 | Apache 2.0 | https://github.com/kislyuk/argcomplete |
 
-## esptool (GPLv2+) — important
+BSD-3-Clause is permissive and Apache-2.0-compatible. There is no GPL code in this repository.
 
-esptool is the only GPL-licensed component in this project. Its presence does **not** infect the rest of the codebase because:
+## What's *not* vendored
 
-- The project's scripts invoke esptool only as a separate subprocess (`[sys.executable, "-m", "esptool", ...]`)
-- No file in this project does `import esptool`
-- esptool's source is bundled in `onboard/scripts/vendor/esptool/` as an aggregated work, not as a linked library
+`esptool` (GPLv2+) is required at runtime by the flash stage but is **not** bundled with this repository. The skill's preflight installs it via `pip install esptool` on first run if it isn't already in the user's environment. Declared as a runtime dependency in [`requirements.txt`](requirements.txt). For a reproducible setup, run:
 
-This usage pattern is consistent with the GPL's distinction between mere aggregation and a derivative work.
+```
+python3 -m pip install --user -r requirements.txt
+```
 
-If you redistribute this repository, you must comply with the GPL for the esptool portion specifically: provide the source (already included), preserve the license text (in `onboard/scripts/vendor/esptool-4.11.0.dist-info/licenses/LICENSE`), and don't add restrictions on downstream use of that component.
+This separation keeps the repository cleanly Apache-2.0 — no GPL aggregation — while preserving the "clone and run" experience for end users (the auto-install on first run is silent unless something is missing).
 
-If GPL distribution is incompatible with your use case, you can:
+If you want to add esptool back as a vendored dependency for offline use, follow the refresh procedure in `onboard/scripts/vendor/__init__.py` (and accept the GPL implications for your distribution).
 
-1. Delete `onboard/scripts/vendor/esptool*` and `onboard/scripts/vendor/esp_rfc2217_server/` (the latter is shipped with esptool).
-2. Have users `pip install esptool` at runtime — `onboard.py`'s preflight already falls back to this when the vendor dir is incomplete.
+## Why pyserial is vendored
 
-## Why these packages are vendored
-
-`onboard/scripts/vendor/` exists so a fresh clone works on macOS, Linux, and Windows with zero `pip install` step. esptool needs `bitstring`, `ecdsa`, `intelhex`, `pyserial`, `pycparser`, `reedsolo`, and `six` at runtime; we ship pinned versions of all of them so users don't hit dependency-resolution surprises mid-flash. `argcomplete` is a top-level esptool dep for shell completion.
-
-C-extension packages that pip's `--target` would otherwise pull in (`cryptography`, `cffi`, `bitarray`, `_yaml`, `tibs`) are intentionally **not** vendored — they're only used by `espsecure` (secure-boot signing), which this project never invokes, and they would force per-OS binary wheels.
+`pyserial` provides the serial-port abstractions used everywhere in the skill. Vendoring a pinned copy means port enumeration and REPL I/O work on a fresh clone with no pip step at all, which keeps the cold-start path to a single command. Permissive license, single package, no transitive deps — small surface area, large UX win.
 
 ## Refresh procedure
 
-See `onboard/scripts/vendor/__init__.py` for the exact pip command, version pins, and post-install pruning steps used to regenerate the vendor tree.
+See `onboard/scripts/vendor/__init__.py` for the exact pip command and version pin used to regenerate the pyserial vendor tree.

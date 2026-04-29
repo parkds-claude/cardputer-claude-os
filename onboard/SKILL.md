@@ -140,10 +140,10 @@ Once `m5-onboard go` finishes at the `DONE` banner, the device is ready to use o
 
 ## Dependencies
 
-- `esptool` (`pip install esptool`) — auto-discovered on `$PATH` and in per-platform user-install directories: `~/Library/Python/*/bin/` on macOS, `~/.local/bin/` on Linux, `%APPDATA%\Python\Python3XX\Scripts\` on Windows.
-- `pyserial` (`pip install pyserial`)
+- `pyserial` — vendored at `onboard/scripts/vendor/serial/` (pinned 3.5, BSD-3-Clause).
+- `esptool` — pip dependency, declared in `requirements.txt`. Importable check happens via `importlib.util.find_spec("esptool")`; binary backstop search covers `~/Library/Python/*/bin/` on macOS, `~/.local/bin/` on Linux, `%APPDATA%\Python\Python3XX\Scripts\` on Windows.
 
-`onboard.py` runs a preflight check at startup: if either dependency is missing it lists them and asks the user whether to install now. On `Y` (or Enter) it runs `python -m pip install --user pyserial esptool` in the current interpreter, then verifies. Inside a venv the `--user` flag is dropped so the install lands in the venv's site-packages. Non-interactive callers (piped stdin) get a manual-install hint instead of a prompt.
+`onboard.py` runs a preflight check at startup: if `esptool` (or, in the rare prune-vendor case, `pyserial`) is missing, it lists what's needed and asks the user whether to install now. On `Y` (or Enter) it runs `python -m pip install --user <missing>` in the current interpreter, then verifies. Inside a venv the `--user` flag is dropped so the install lands in the venv's site-packages. Non-interactive callers (piped stdin) get a manual-install hint instead of a prompt.
 
 Python itself has to exist before this skill can do anything — you can't bootstrap an interpreter from inside one. Same story for `git` (needed once, to clone the skill and bundle repos). Claude's responsible for detecting both and installing whatever's missing *before* running any `scripts/*.py` invocation. Detection is just running `python3 --version` / `python --version` and `git --version` — if either fails, Claude fetches them with the host's native package manager before anything else.
 
@@ -161,15 +161,19 @@ Python itself has to exist before this skill can do anything — you can't boots
 - **macOS** — Python 3 is usually pre-installed as `/usr/bin/python3` on any current macOS (shipped by Apple). If for some reason it isn't, `brew install python@3.13` via Homebrew is the go-to; if Homebrew itself is missing, offer to install it via `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"` (but only if the user confirms — Homebrew is a larger commitment than winget).
 - **Linux** — use the distro package manager. Debian/Ubuntu: `sudo apt-get update && sudo apt-get install -y python3 python3-pip`. Fedora: `sudo dnf install -y python3 python3-pip`. Arch: `sudo pacman -S --noconfirm python python-pip`. You may need to sudo and should surface the password prompt to the user if needed.
 
-**esptool and pyserial — already shipped with the skill:**
+**pyserial — bundled with the skill:**
 
-The skill ships a pre-installed, pinned copy of pyserial, esptool, and their pure-Python transitive dependencies in `scripts/vendor/`. Every script that imports them calls `vendor_path.ensure_on_syspath()` before the first third-party import, which prepends `scripts/vendor/` to `sys.path`. For subprocess calls to esptool we use `[sys.executable, "-m", "esptool", ...]` with a `PYTHONPATH` that includes the vendor dir. Net effect: a fresh clone needs zero pip-install on any OS, works offline, and we're locked to the esptool 4.11 / pyserial 3.5 versions we've actually tested against rather than whatever pip happens to fetch.
+A pinned `pyserial 3.5` ships under `scripts/vendor/` (BSD-3-Clause, Apache-compatible). Every script that imports `serial` calls `vendor_path.ensure_on_syspath()` before the first third-party import, which prepends `scripts/vendor/` to `sys.path`, so the vendored copy resolves regardless of whatever the user has system-wide. Net effect: port enumeration and REPL I/O work on a fresh clone with zero pip step. ~500 KB, pure-Python, same tree on macOS / Linux / Windows.
 
-Vendor dir is ~5.6 MB and contains only pure-Python packages; no `.so` / `.pyd` / `.dylib` files, so the same tree works on macOS, Linux, and Windows unchanged. C-extension packages that got pulled in by `pip install --target` (`cryptography`, `cffi`, `bitarray`, `_yaml`, `tibs`) were stripped because (a) they're platform-specific and (b) none of them are needed for `write_flash` — they're used only by `espsecure` (secure-boot signing) which we don't invoke. See `scripts/vendor/__init__.py` for the exact refresh procedure and version pins.
+**esptool — pip dependency, auto-installed on first run:**
+
+`esptool` is GPLv2+ and is intentionally **not** vendored — keeping the repository cleanly Apache-2.0 means the GPL bits live in the user's pip-managed environment, not in the tree. The skill's preflight checks for an importable `esptool` and, if missing, prompts to install it (`python -m pip install --user esptool` — `--user` dropped inside a venv so it lands in site-packages). For subprocess calls we use `[sys.executable, "-m", "esptool", ...]`; the subprocess inherits user-site so the pip-installed module imports cleanly. `requirements.txt` declares this for explicit setup; the prompt path is the default for first-time attendees who haven't run pip yet.
+
+Non-interactive callers (piped stdin, CI) skip the prompt and get a `python -m pip install --user esptool` hint instead.
 
 **Fallback if someone prunes `scripts/vendor/`:**
 
-`onboard.py`'s preflight checks `vendor_path.is_available()`. If the vendor dir is missing and the user's environment also doesn't have pyserial/esptool, it falls back to the old interactive behavior: prompt to `pip install --user pyserial esptool`, run it, verify. This handles the case where someone downloaded a source-only zip that excluded vendor, or manually trimmed the repo to save space. Non-interactive callers (piped stdin) get a manual-install hint instead of a prompt.
+The same preflight path also re-installs pyserial via pip if the vendor copy is gone. This handles the case where someone downloaded a source-only zip that excluded vendor, or manually trimmed the repo to save space.
 
 **USB driver — Windows-specific, only for older boards:**
 

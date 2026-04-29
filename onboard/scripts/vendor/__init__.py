@@ -1,58 +1,53 @@
 """Vendored dependencies for the m5-onboard skill.
 
-This directory contains pre-installed copies of ``pyserial``,
-``esptool``, and their pure-Python dependencies. Shipping them with
-the repo means the skill works on a fresh machine without a pip
-install step — zero-friction cross-platform install, and we pin the
-known-good versions we've tested against rather than rolling the
-dice on whatever pip happens to fetch.
+This directory contains a pre-installed copy of ``pyserial`` only.
+Shipping it with the repo means port enumeration and REPL I/O work
+on a fresh clone with no pip step at all, which keeps the cold-
+start path to a single command.
+
+esptool is **not** vendored here. It is GPLv2+; vendoring it would
+mix license terms inside what we want to keep as a clean Apache-2.0
+repository. The skill declares esptool as a pip dependency in
+``requirements.txt`` and auto-installs it on first run if it isn't
+already in the user's environment.
 
 ### How it gets used
 
 ``scripts/vendor_path.py`` is the public helper — each script that
-needs esptool or pyserial calls :func:`vendor_path.ensure_on_syspath`
-at the very top, which prepends this directory to ``sys.path``. Any
-subsequent ``import serial``, ``import esptool`` etc. then resolves
-to the vendored copy.
+needs pyserial calls :func:`vendor_path.ensure_on_syspath` at the
+very top, which prepends this directory to ``sys.path``. Any
+subsequent ``import serial`` then resolves to the vendored copy.
 
 For subprocess calls to esptool we use
-``[sys.executable, "-m", "esptool", ...]`` rather than hunting the
-binary on ``$PATH``. The ``-m`` import path honors the vendored
-copy because the parent script has already put ``vendor/`` on
-``sys.path`` before spawning the subprocess — and the subprocess
-inherits ``PYTHONPATH`` explicitly via
-``vendor_path.subprocess_env()``.
+``[sys.executable, "-m", "esptool", ...]``. The subprocess inherits
+the parent process's user-site, so a pip-installed esptool is
+importable from inside it. ``vendor_path.subprocess_env()`` also
+adds this directory to ``PYTHONPATH`` so esptool can find pyserial
+from the vendored tree.
 
 ### Refresh
 
-To rebuild the vendor tree against new upstream versions:
+To rebuild the vendor tree against a new upstream pyserial:
 
     cd <repo-root>
-    rm -rf scripts/vendor
-    mkdir -p scripts/vendor
-    python3 -m pip install --target scripts/vendor \\
-        'esptool==4.11.0' 'pyserial==3.5'
-    # Remove C-extension packages we don't need — esptool's
-    # flash path is pure-Python friendly without them, and
-    # shipping .so/.pyd breaks the cross-platform story.
-    cd scripts/vendor
-    rm -rf _cffi_backend.* cffi cffi-*.dist-info
-    rm -rf cryptography cryptography-*.dist-info
-    rm -rf _yaml yaml pyyaml-*.dist-info
-    rm -rf bitarray bitarray-*.dist-info
-    rm -rf tibs tibs-*.dist-info
-    rm -rf espefuse espsecure esp_rfc2217_server bin
+    rm -rf onboard/scripts/vendor/serial onboard/scripts/vendor/pyserial-*.dist-info
+    python3 -m pip install --target onboard/scripts/vendor \\
+        'pyserial==3.5'
+    cd onboard/scripts/vendor
     rm -rf __pycache__
 
     # Restore this __init__.py (pip install --target clobbers it)
     git checkout __init__.py
 
-### Version pins
+If you ever want to revive offline-friendly esptool vendoring, add
+``'esptool==4.11.0'`` to the same install, then strip the C-extension
+packages pip pulls in (cryptography, cffi, _yaml, bitarray, tibs)
+and the espefuse / espsecure / esp_rfc2217_server / bin trees that
+ship alongside esptool's own source. Be aware that this
+re-introduces GPL code into the repo and you'll need to update
+LICENSE-THIRD-PARTY.md and NOTICE accordingly.
 
-esptool==4.11.0 — pinned because:
-  - 5.x introduced the ``no-reset`` vs ``no_reset`` arg-name
-    split that broke us until we normalized to underscores
-  - 4.x is a mature LTS-ish release that still gets security fixes
+### Version pins
 
 pyserial==3.5 — pinned because:
   - 3.5 is the current stable; the changelog is sparse and

@@ -521,6 +521,14 @@ def _esptool_path_candidates() -> list[str]:
 
 
 def _esptool_present() -> bool:
+    # Importable check first: flash.py invokes esptool via
+    # ``python -m esptool`` (subprocess inherits user-site), so
+    # importability is what actually matters. The binary hunt below
+    # is a backstop for environments where esptool only landed in a
+    # bin/Scripts directory and the importable module isn't on
+    # sys.path for some reason.
+    if importlib.util.find_spec("esptool") is not None:
+        return True
     for name in ("esptool.py", "esptool", "esptool.exe"):
         if shutil.which(name):
             return True
