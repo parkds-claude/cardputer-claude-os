@@ -1,21 +1,42 @@
-// Push-to-Claude relay.
+// Worker entrypoint.
 //
-// Endpoints:
-//   POST /ask         — body is raw WAV audio. Whisper STT -> Claude.
-//   POST /ask-text    — body is JSON {prompt}. Claude direct.
-//   POST /reset       — clear this device's stored conversation history.
-//   GET  /            — health probe.
+// Two product surfaces share this Worker:
 //
-// All authenticated by `x-device-secret` matching env.DEVICE_SECRET.
+//   1. Push-to-Claude (existing) — single-turn voice/text chat with
+//      Haiku. Keeps the original /ask, /ask-text, /reset endpoints
+//      and KV-backed conversation history.
 //
-// Conversation memory: last ~8 messages (4 turns) per device-secret are
-// kept in Workers KV (binding "HISTORY") with a 24h TTL. Each /ask or
-// /ask-text request loads them, appends the new user turn, sends the
-// full sequence to Claude, then appends the assistant turn back to KV.
-// This is what turns the device from a one-shot query box into a chat
-// partner that remembers what you just talked about.
+//   2. Cardputer Pager + Central Console (new) — fire-and-monitor
+//      cloud agents using the Managed Agents API. Each session gets
+//      a SessionRouter Durable Object that mirrors event history
+//      and serves the Pager (poll) + Console (SSE) surfaces.
+//
+// Both surfaces auth via the same DEVICE_SECRET, sent as
+// `x-device-secret` (device-side) or `?token=...` (browser).
 
-const SYSTEM_PROMPT =
+import {
+  authenticate,
+  handleConfirm,
+  handleDelete,
+  handleInterrupt,
+  handlePoll,
+  handleRename,
+  handleReply,
+  handleSessions,
+  handleSpawn,
+} from "./pager.js";
+import {
+  handleConsolePage,
+  handleFileDownload,
+  handleFilesList,
+  handleStream,
+} from "./console_routes.js";
+
+export { SessionRouter } from "./router.do.js";
+
+// ---- Push-to-Claude (existing) -------------------------------------
+
+const CHAT_SYSTEM_PROMPT =
   "You are Claude responding on a 240x135 pixel handheld LCD. " +
   "Reply in 1-3 short sentences. Plain ASCII when possible. " +
   "No markdown, no lists, no code fences. " +
@@ -23,30 +44,9 @@ const SYSTEM_PROMPT =
   "You may receive a few prior turns of conversation history; " +
   "treat the latest user message as the current question.";
 
-const CLAUDE_MODEL = "claude-haiku-4-5-20251001";
-const HISTORY_MAX_MESSAGES = 8; // 4 user/assistant pairs
+const CHAT_MODEL = "claude-haiku-4-5-20251001";
+const HISTORY_MAX_MESSAGES = 8;
 const HISTORY_TTL_SECONDS = 24 * 3600;
-
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    if (request.method === "GET" && url.pathname === "/") {
-      return new Response("push-to-claude relay ok\n", {
-        headers: { "content-type": "text/plain" },
-      });
-    }
-    if (request.method === "POST" && url.pathname === "/ask") {
-      return handleAsk(request, env);
-    }
-    if (request.method === "POST" && url.pathname === "/ask-text") {
-      return handleAskText(request, env);
-    }
-    if (request.method === "POST" && url.pathname === "/reset") {
-      return handleReset(request, env);
-    }
-    return new Response("not found\n", { status: 404 });
-  },
-};
 
 function authOk(request, env) {
   return request.headers.get("x-device-secret") === env.DEVICE_SECRET;
@@ -79,7 +79,7 @@ async function appendTurn(env, deviceSecret, userMsg, assistantMsg) {
   });
 }
 
-async function callClaude(env, deviceSecret, userMessage) {
+async function callHaiku(env, deviceSecret, userMessage) {
   const history = await getHistory(env, deviceSecret);
   const messages = [...history, { role: "user", content: userMessage }];
 
@@ -91,9 +91,9 @@ async function callClaude(env, deviceSecret, userMessage) {
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model: CLAUDE_MODEL,
+      model: CHAT_MODEL,
       max_tokens: 250,
-      system: SYSTEM_PROMPT,
+      system: CHAT_SYSTEM_PROMPT,
       messages,
     }),
   });
@@ -104,19 +104,16 @@ async function callClaude(env, deviceSecret, userMessage) {
   }
   const data = await claudeResp.json();
   const text = (data.content?.[0]?.text || "").trim() || "(empty)";
-  // Persist the turn even on transport-fine but logically-empty
-  // responses; the user just had a turn and we want history to
-  // reflect that. Skip persistence on errors.
   await appendTurn(env, deviceSecret, userMessage, text);
   return { ok: true, text };
 }
 
 async function handleAsk(request, env) {
-  if (!authOk(request, env)) return json({ error: "unauthorized" }, 401);
+  if (!authOk(request, env)) return jsonResp({ error: "unauthorized" }, 401);
 
   const audioBytes = await request.arrayBuffer();
   if (audioBytes.byteLength < 200) {
-    return json(
+    return jsonResp(
       { error: "audio too short", bytes: audioBytes.byteLength },
       400,
     );
@@ -141,20 +138,20 @@ async function handleAsk(request, env) {
   );
   if (!whisperResp.ok) {
     const detail = (await whisperResp.text()).slice(0, 300);
-    return json(
+    return jsonResp(
       { error: "whisper failed", status: whisperResp.status, detail },
       502,
     );
   }
   const transcript = (await whisperResp.text()).trim();
   if (!transcript) {
-    return json({ transcript: "", response: "(no speech)" });
+    return jsonResp({ transcript: "", response: "(no speech)" });
   }
 
   const deviceSecret = request.headers.get("x-device-secret");
-  const result = await callClaude(env, deviceSecret, transcript);
+  const result = await callHaiku(env, deviceSecret, transcript);
   if (!result.ok) {
-    return json(
+    return jsonResp(
       {
         transcript,
         error: "claude failed",
@@ -164,24 +161,24 @@ async function handleAsk(request, env) {
       502,
     );
   }
-  return json({ transcript, response: result.text });
+  return jsonResp({ transcript, response: result.text });
 }
 
 async function handleAskText(request, env) {
-  if (!authOk(request, env)) return json({ error: "unauthorized" }, 401);
+  if (!authOk(request, env)) return jsonResp({ error: "unauthorized" }, 401);
   let data;
   try {
     data = await request.json();
   } catch {
-    return json({ error: "invalid json" }, 400);
+    return jsonResp({ error: "invalid json" }, 400);
   }
   const prompt = ((data.prompt || data.text || "") + "").trim();
-  if (!prompt) return json({ error: "empty prompt" }, 400);
+  if (!prompt) return jsonResp({ error: "empty prompt" }, 400);
 
   const deviceSecret = request.headers.get("x-device-secret");
-  const result = await callClaude(env, deviceSecret, prompt);
+  const result = await callHaiku(env, deviceSecret, prompt);
   if (!result.ok) {
-    return json(
+    return jsonResp(
       {
         transcript: prompt,
         error: "claude failed",
@@ -191,19 +188,95 @@ async function handleAskText(request, env) {
       502,
     );
   }
-  return json({ transcript: prompt, response: result.text });
+  return jsonResp({ transcript: prompt, response: result.text });
 }
 
 async function handleReset(request, env) {
-  if (!authOk(request, env)) return json({ error: "unauthorized" }, 401);
+  if (!authOk(request, env)) return jsonResp({ error: "unauthorized" }, 401);
   const deviceSecret = request.headers.get("x-device-secret");
   if (env.HISTORY) {
     await env.HISTORY.delete(historyKey(deviceSecret));
   }
-  return json({ ok: true, cleared: true });
+  return jsonResp({ ok: true, cleared: true });
 }
 
-function json(obj, status = 200) {
+// ---- Router ---------------------------------------------------------
+
+// (method, path) → handler. The Pager handlers receive the resolved
+// auth object; the chat handlers do their own auth (header-only —
+// voice uploads aren't sent from a browser, so no `?token=` escape
+// hatch is needed there).
+const PAGER_ROUTES = {
+  "POST /pager/spawn": handleSpawn,
+  "GET /pager/sessions": handleSessions,
+  "GET /pager/poll": handlePoll,
+  "POST /pager/interrupt": handleInterrupt,
+  "POST /pager/reply": handleReply,
+  "POST /pager/confirm": handleConfirm,
+  "POST /pager/delete": handleDelete,
+  "POST /pager/rename": handleRename,
+
+  "GET /console/stream": handleStream,
+  "GET /console/sessions": handleSessions,
+  "GET /console/files": handleFilesList,
+  "GET /console/file": handleFileDownload,
+  "POST /console/spawn": handleSpawn,
+  "POST /console/reply": handleReply,
+  "POST /console/interrupt": handleInterrupt,
+  "POST /console/delete": handleDelete,
+  "POST /console/rename": handleRename,
+  "POST /console/confirm": handleConfirm,
+};
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const key = `${request.method} ${url.pathname}`;
+
+    if (request.method === "GET" && url.pathname === "/") {
+      return new Response("push-to-claude relay ok\n", {
+        headers: { "content-type": "text/plain" },
+      });
+    }
+
+    // Push-to-Claude (single-turn). Untouched.
+    if (request.method === "POST" && url.pathname === "/ask")
+      return handleAsk(request, env);
+    if (request.method === "POST" && url.pathname === "/ask-text")
+      return handleAskText(request, env);
+    if (request.method === "POST" && url.pathname === "/reset")
+      return handleReset(request, env);
+
+    // Console page (no auth at the page itself; auth is on the
+    // subsequent fetch calls, where the user types the secret).
+    if (
+      request.method === "GET" &&
+      (url.pathname === "/console" || url.pathname === "/console/")
+    ) {
+      return handleConsolePage();
+    }
+
+    if (PAGER_ROUTES[key]) {
+      const auth = await authenticate(request, env);
+      if (!auth) return jsonResp({ error: "unauthorized" }, 401);
+      try {
+        return await PAGER_ROUTES[key](request, env, auth);
+      } catch (err) {
+        // Inner handlers normally shape their own errors, but DO RPC
+        // and upstream Anthropic errors can bubble. Always return
+        // JSON so the Pager + Console can render something useful.
+        return jsonResp(
+          { error: "internal", message: String(err?.message || err) },
+          500,
+        );
+      }
+    }
+
+    return new Response("not found\n", { status: 404 });
+  },
+};
+
+function jsonResp(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
     headers: { "content-type": "application/json" },

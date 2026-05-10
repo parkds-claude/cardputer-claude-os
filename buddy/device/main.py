@@ -236,15 +236,25 @@ def _discover_apps():
     filenames without forcing us to ship a separate metadata file.
     """
     try:
+        # Accept both .py source and .mpy bytecode. Larger apps ship as
+        # .mpy because parsing the source-form on a heap-tight launcher
+        # boot can OOM-panic the chip; pager.mpy is the canonical case.
+        # If both forms are present for the same basename, MicroPython's
+        # importer picks .py first (and we de-dupe below).
         files = sorted(
-            f for f in os.listdir(_APPS_DIR) if f.endswith(".py")
+            f for f in os.listdir(_APPS_DIR)
+            if f.endswith(".py") or f.endswith(".mpy")
         )
     except OSError as e:
         print("launcher: cannot list", _APPS_DIR, e)
         return []
     out = []
+    seen_mods = set()
     for fname in files:
-        mod = fname[:-3]
+        mod = fname[:-4] if fname.endswith(".mpy") else fname[:-3]
+        if mod in seen_mods:
+            continue
+        seen_mods.add(mod)
         # Skip dunder / private files defensively — nothing in the
         # bundle today uses them, but a future .py dropped in for a
         # helper shouldn't land in the visible menu. Also skip

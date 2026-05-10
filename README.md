@@ -10,8 +10,17 @@ that turn the Cardputer into a hand-held Claude device:
   send. Whisper transcribes, Claude Haiku 4.5 replies on the LCD, and a
   per-device 24-hour memory keeps context across turns. Type-mode also
   available for noisy rooms.
+- **Claude Pager** — type a task on the QWERTY, fire it off as a
+  long-running [Managed Agents] session in the cloud, and watch live
+  status (`bash: pytest …`, `wrote auth_test.py`, `idle ✓`) on the LCD.
+  Inbox lists active sessions; Detail screen lets you reply, interrupt,
+  or approve pending tool calls from your pocket. Pairs with the
+  **Central Console** browser UI on your Mac and the `claude-pull`
+  artifact sync.
 - **Hello / Snake** — minimal example app + a snake game so the bundle
   isn't all serious business.
+
+[Managed Agents]: https://platform.claude.com/docs/en/managed-agents/overview
 
 > **Forked from** [`moremas/build-with-claude`](https://github.com/moremas/build-with-claude).
 > This fork adds the `worker/` directory (a Cloudflare Worker that
@@ -21,11 +30,15 @@ that turn the Cardputer into a hand-held Claude device:
 
 ## What's new in this fork
 
-| Addition                       | Where                                                                        | What it does                                                                                                                                          |
-| ------------------------------ | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Cloudflare Worker relay**    | [`worker/`](worker/)                                                         | Auth-gated edge endpoint. Whisper for STT, Claude Haiku 4.5 for the reply, Workers KV for per-device conversation memory (last 8 messages, 24 h TTL). |
-| **Voice + chat app**           | [`buddy/device/apps/push_to_claude.py`](buddy/device/apps/push_to_claude.py) | On-device client. Streams WAV to the Worker as it records (flat RAM footprint), text-fallback mode, scrollable replies, `/reset` shortcut.            |
-| **Externalized device config** | [`buddy/device/apps/config.example.py`](buddy/device/apps/config.example.py) | Worker URL + device secret loaded from a gitignored `config.py` so secrets never enter the repo.                                                      |
+| Addition                         | Where                                                                                     | What it does                                                                                                                                                                                       |
+| -------------------------------- | ----------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Cloudflare Worker relay**      | [`worker/`](worker/)                                                                      | Auth-gated edge endpoint. Whisper for STT, Claude Haiku 4.5 for the reply, Workers KV for per-device conversation memory (last 8 messages, 24 h TTL).                                              |
+| **Voice + chat app**             | [`buddy/device/apps/push_to_claude.py`](buddy/device/apps/push_to_claude.py)              | On-device client. Streams WAV to the Worker as it records (flat RAM footprint), text-fallback mode, scrollable replies, `/reset` shortcut.                                                         |
+| **Pager device app**             | [`buddy/device/apps/pager.py`](buddy/device/apps/pager.py)                                | Three-screen UI (Compose / Inbox / Detail) for firing and triaging Managed Agents sessions from the QWERTY. Long-polls the Worker for live event ticker.                                           |
+| **SessionRouter Durable Object** | [`worker/src/router.do.js`](worker/src/router.do.js)                                      | One DO per Anthropic session. Lazily polls the Managed Agents `events.list` endpoint, mirrors events into DO storage, and serves both the Pager (poll) and Console (SSE).                          |
+| **Central Console (browser)**    | [`worker/src/console.html`](worker/src/console.html)                                      | Single-file dark-theme HTML console served from the Worker. Live event stream, syntax-highlighted bash, inline diffs for `str_replace`, file pills, interrupt + reply. Token-gated, no build step. |
+| **Mac artifact sync**            | [`mac/claude-pull`](mac/claude-pull) + [`launchd plist`](mac/com.claude.pager.pull.plist) | Stdlib Python script run every 60 s by launchd. Pulls each session's `/workspace/out/` files into `~/ClaudeRuns/<title>-<id>/` and posts a banner notification when a session completes.           |
+| **Externalized device config**   | [`buddy/device/apps/config.example.py`](buddy/device/apps/config.example.py)              | Worker URL + device secret loaded from a gitignored `config.py` so secrets never enter the repo.                                                                                                   |
 
 See [`worker/README.md`](worker/README.md) for the full Cloudflare deploy
 guide.
@@ -91,6 +104,126 @@ of one-time setup; after that every voice/text turn is a single tap.
 4. Boot the device → **Push to Claude** → tap SPACE.
 
 `config.py` is gitignored — your secret stays on your machine.
+
+---
+
+## Quick start — Claude Pager + Central Console (cloud agents)
+
+The Pager turns the Cardputer into a remote control + status display
+for [Anthropic Managed Agents] sessions. Type a task on the QWERTY,
+fire it, and watch the device tick through `bash`, `write`, `idle ✓`
+in real time. A self-contained HTML console on your Mac mirrors the
+same sessions with a full terminal-style event log; a launchd job
+syncs artifacts the agent saves into `~/ClaudeRuns/`.
+
+[Anthropic Managed Agents]: https://platform.claude.com/docs/en/managed-agents/overview
+
+The Pager rides on the same Worker as Push to Claude — finish that
+quick start first. Then:
+
+1. **Provision an extra KV namespace** for the session index:
+
+   ```bash
+   cd worker
+   npx wrangler kv namespace create INDEX
+   ```
+
+   Paste the returned id into `worker/wrangler.toml`, replacing
+   `REPLACE_WITH_YOUR_INDEX_KV_ID`.
+
+2. **Add the Durable Object migration** (already in `wrangler.toml`)
+   and redeploy:
+
+   ```bash
+   npx wrangler deploy
+   ```
+
+   First deploy registers the `SessionRouter` DO via the v1 migration
+   block; subsequent deploys are normal.
+
+3. **Open the Central Console** at
+   `https://<your-worker>.workers.dev/console`. On first load it asks
+   for your `DEVICE_SECRET` (same value as the Cardputer); the secret
+   is stored in browser localStorage and never sent anywhere except
+   your Worker. Hit `+ New`, type a task, watch it run.
+
+4. **Push the Pager app** to the Cardputer. It ships as pre-compiled
+   bytecode (`.mpy`) because the source-form is too large to parse
+   inside the launcher's residual heap:
+
+   ```bash
+   pip3 install --user --break-system-packages mpy-cross
+   python3 buddy/scripts/push_pager_mpy.py --port <PORT>
+   ```
+
+   Reboot the device and pick **Pager** from the launcher menu.
+
+5. **(Optional) Mac artifact sync.** Agents save user-facing
+   artifacts into `/workspace/out/` inside their container. The
+   `mac/claude-pull` script mirrors them to `~/ClaudeRuns/<title>-<id>/`
+   on a 60-second launchd schedule and pings you with a banner when
+   a session completes.
+   ```bash
+   ./mac/install_launchd.sh        # writes a stub config and exits
+   $EDITOR ~/.config/claude-pager/config.json   # paste worker_base + device_secret
+   ./mac/install_launchd.sh        # second run actually loads launchd
+   ```
+   Logs land at `/tmp/claude-pull.{out,err}.log`. Run manually with
+   `./mac/claude-pull -v`.
+
+### Using the Pager
+
+Three screens, switched with the arrow cluster:
+
+```
+COMPOSE   ← →   INBOX   →   DETAIL
+                            (Enter on a row)
+```
+
+- **Compose** — type a task and Enter to launch. `→` jumps to Inbox
+  without sending.
+- **Inbox** — live list of recent sessions with status pip + last-tool
+  subline. Refreshed every 4 s. Up/Down to scroll, Enter to drill into
+  Detail, `D` to delete, `N` to jump back to Compose.
+- **Detail** — live ticker for one session. Long-polls the Worker so
+  deltas show within ~1 s of the agent acting.
+  - `R` reply (sends a follow-up message)
+  - `I` interrupt (sends `user.interrupt`)
+  - `Y/N` approve/deny pending tool confirmation (when present)
+  - `Esc` back to Inbox
+
+Notifications fire across **every** screen — the Pager polls the
+Worker every 15 s in the background. When an agent transitions:
+
+| Trigger                   | Beep               | Banner                        |
+| ------------------------- | ------------------ | ----------------------------- |
+| `running` → `idle`        | A5 → E6 chirp      | green **DONE: <title>**       |
+| pending tool confirmation | triple D6 urgent   | yellow **NEEDS YOU: <title>** |
+| → `terminated`            | A4 → A3 descending | red **ERROR: <title>**        |
+
+State is persisted to `/flash/.pager_notif.json` so the same DONE
+doesn't re-fire after a reboot.
+
+### Using the Central Console
+
+Browser tab at `<your-worker>/console`. Token-gated, dark theme,
+monospace. Left rail = sessions, main pane = event stream with:
+
+- syntax-highlighted bash blocks
+- inline diffs for `str_replace` tool calls
+- collapsible tool-result blocks
+- pending-confirmation `y`/`n` buttons in the composer
+- file pills along the bottom — click to download
+
+Press `n` (when no input is focused) to fire a new task. Use `⌘/Ctrl-Enter`
+in the composer or the spawn modal to send.
+
+### Cost guard
+
+Each Managed Agents session keeps a cloud container hot for its
+lifetime — typically a few cents to a couple of dollars per task.
+The Worker enforces a per-device daily spawn cap (`PAGER_DAILY_SPAWN_CAP`
+in `wrangler.toml`, default 30). Bump or lower it to taste.
 
 ---
 

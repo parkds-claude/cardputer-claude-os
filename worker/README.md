@@ -1,20 +1,29 @@
-# Push-to-Claude Worker
+# Cardputer Worker
 
-A small Cloudflare Worker that turns the Cardputer into a voice + text
-chat client for Claude. The device records WAV audio (or types text)
-and POSTs it here; the Worker runs Whisper for STT, calls Claude
-Haiku 4.5 with the last few turns of conversation context, and returns
-a reply for the device to render on its 240×135 LCD.
+A small Cloudflare Worker that powers two surfaces on the Cardputer:
+
+- **Push to Claude** — single-turn voice/text chat with Haiku.
+- **Claude Pager + Central Console** — fire-and-monitor cloud agents
+  using the [Managed Agents API]. Sessions run in cloud containers
+  with bash + file + web tools, stream events back through the Worker,
+  and sync artifacts to your Mac.
 
 ```
-Cardputer-Adv ──► Cloudflare Worker ──► OpenAI Whisper (STT)
-                          │
-                          └──────────► Anthropic /v1/messages (Claude)
-                          │
-                          └─ Workers KV: per-device 8-message history (24h TTL)
+Cardputer ──► Cloudflare Worker ──► OpenAI Whisper          (chat: voice STT)
+   Pager        ├─► /v1/messages           Claude Haiku    (chat: reply)
+   Browser  ──► ├─► /v1/sessions/...       Managed Agents  (pager + console)
+   Mac sync ──► └─► /v1/files/...          Files API       (artifact pull)
+                  │
+                  ├─ KV "HISTORY"   per-device chat memory (24h TTL)
+                  ├─ KV "INDEX"     per-device session list, agent IDs, spend
+                  └─ DO  SessionRouter  one-per-session event mirror
 ```
+
+[Managed Agents API]: https://platform.claude.com/docs/en/managed-agents/overview
 
 ## Endpoints
+
+### Push to Claude (single-turn chat)
 
 | Method | Path        | Body            | Returns                       |
 | ------ | ----------- | --------------- | ----------------------------- |
@@ -23,8 +32,33 @@ Cardputer-Adv ──► Cloudflare Worker ──► OpenAI Whisper (STT)
 | `POST` | `/reset`    | empty           | `{ ok: true, cleared: true }` |
 | `GET`  | `/`         | —               | health probe                  |
 
-All write endpoints require an `x-device-secret` header that matches
-the Worker's `DEVICE_SECRET` secret.
+### Pager (Cardputer-side, polling)
+
+| Method | Path               | Body / params                          | Returns                        |
+| ------ | ------------------ | -------------------------------------- | ------------------------------ |
+| `POST` | `/pager/spawn`     | `{prompt, title?, kind?, session_id?}` | `{ok, session_id, title}`      |
+| `GET`  | `/pager/sessions`  | —                                      | `{sessions: [...]}`            |
+| `GET`  | `/pager/poll`      | `?session=<id>&since=<seq>&wait=1`     | `{meta, summary, events, seq}` |
+| `POST` | `/pager/reply`     | `{session_id, prompt}`                 | `{ok}`                         |
+| `POST` | `/pager/interrupt` | `{session_id, prompt?}`                | `{ok}`                         |
+| `POST` | `/pager/confirm`   | `{session_id, tool_use_id, approve}`   | `{ok}`                         |
+| `POST` | `/pager/delete`    | `{session_id}`                         | `{ok}`                         |
+| `POST` | `/pager/rename`    | `{session_id, title}`                  | `{ok, meta}`                   |
+
+### Central Console (browser-side, SSE)
+
+| Method | Path                                                     | Notes                                        |
+| ------ | -------------------------------------------------------- | -------------------------------------------- |
+| `GET`  | `/console`                                               | Self-contained HTML console UI               |
+| `GET`  | `/console/stream?session=<id>`                           | Server-Sent Events stream of session events  |
+| `GET`  | `/console/sessions`                                      | Same shape as `/pager/sessions`              |
+| `GET`  | `/console/files?session=<id>`                            | List artifact files in the session container |
+| `GET`  | `/console/file?session=<id>&file_id=<fid>`               | Stream one artifact file                     |
+| `POST` | `/console/{spawn,reply,interrupt,confirm,delete,rename}` | Mirror of pager/\*                           |
+
+All authenticated endpoints accept either `x-device-secret` (header,
+Cardputer) or `?token=` (query string, browser). Both must match the
+Worker's `DEVICE_SECRET` secret.
 
 ## One-time setup
 
@@ -43,28 +77,25 @@ npm install
 npx wrangler login
 ```
 
-### 2. Create a KV namespace for conversation history
+### 2. Create the KV namespaces
+
+Two namespaces — one for chat history (Push to Claude), one for the
+session index (Pager + Console).
 
 ```bash
 npx wrangler kv namespace create HISTORY
+npx wrangler kv namespace create INDEX
 ```
 
-Wrangler prints something like:
-
-```
-[[kv_namespaces]]
-binding = "HISTORY"
-id = "abc123def456..."
-```
-
-Copy the `id` into `worker/wrangler.toml`, replacing `REPLACE_WITH_YOUR_KV_NAMESPACE_ID`.
+Wrangler prints an `id` for each. Paste them into `worker/wrangler.toml`,
+replacing `REPLACE_WITH_YOUR_HISTORY_KV_ID` and `REPLACE_WITH_YOUR_INDEX_KV_ID`.
 
 ### 3. Set the secrets
 
 ```bash
-npx wrangler secret put ANTHROPIC_API_KEY   # paste your Anthropic key
-npx wrangler secret put OPENAI_API_KEY      # paste your OpenAI key
-npx wrangler secret put DEVICE_SECRET       # paste any random 32+ char string
+npx wrangler secret put ANTHROPIC_API_KEY   # used for Haiku chat AND Managed Agents
+npx wrangler secret put OPENAI_API_KEY      # Whisper for voice (skip if you don't use voice)
+npx wrangler secret put DEVICE_SECRET       # any random 32+ char string
 ```
 
 Generate a `DEVICE_SECRET` with:
@@ -73,7 +104,8 @@ Generate a `DEVICE_SECRET` with:
 openssl rand -base64 32
 ```
 
-Save the same `DEVICE_SECRET` — you'll paste it into the device config in the next section.
+Save the same `DEVICE_SECRET` — you'll paste it into the device
+config and (optionally) into the Mac sync config in later steps.
 
 ### 4. Deploy
 
@@ -81,8 +113,12 @@ Save the same `DEVICE_SECRET` — you'll paste it into the device config in the 
 npx wrangler deploy
 ```
 
+The first deploy creates the `SessionRouter` Durable Object class via
+the migration block in `wrangler.toml`. Subsequent deploys are normal.
+
 Wrangler prints your Worker URL, e.g.
-`https://push-to-claude.<your-subdomain>.workers.dev`. Save that too.
+`https://push-to-claude.<your-subdomain>.workers.dev`. The console
+lives at `<that URL>/console`. Save the base URL too.
 
 ### 5. Point the device at your Worker
 
@@ -105,7 +141,36 @@ Then push the apps to the Cardputer:
 python3 .claude/skills/m5-onboard/scripts/install_apps.py --port <PORT> --src buddy
 ```
 
-Boot the device → pick **Push to Claude** from the launcher → tap SPACE to start recording.
+Boot the device → pick an app from the launcher:
+
+- **Push to Claude** — tap SPACE to record voice, T to type.
+- **Pager** — Compose screen by default; type a task and press Enter
+  to fire off a Managed Agents session. → arrow to Inbox to triage
+  active sessions, Enter to drill into Detail.
+
+### 6. (Optional) Open the Central Console on your Mac
+
+Open `https://<your-worker>.workers.dev/console` in any browser. On
+first load it asks for your `DEVICE_SECRET`; store it in localStorage
+and the console reconnects automatically afterward. New sessions you
+fire from the device show up in the left rail; sessions you fire from
+the console show up on the device. Same source of truth.
+
+### 7. (Optional) Set up Mac artifact sync
+
+Agents save user-facing artifacts into `/workspace/out/` inside their
+container. The `mac/claude-pull` script syncs those to
+`~/ClaudeRuns/<title>-<id>/` on your Mac and pings you with a banner
+when a session completes.
+
+```bash
+./mac/install_launchd.sh        # writes a stub config and exits
+$EDITOR ~/.config/claude-pager/config.json   # paste worker_base + device_secret
+./mac/install_launchd.sh        # second run actually installs the agent
+```
+
+The launchd job runs every 60 s. Logs land at
+`/tmp/claude-pull.{out,err}.log`. Run manually with `mac/claude-pull -v`.
 
 ## Local development
 
@@ -135,6 +200,12 @@ npx wrangler tail
 - **Claude Haiku 4.5** is around $1 / MTok input, $5 / MTok output as of
   this writing. With a 250-token output cap and short prompts, each turn
   is well under a cent.
+- **Managed Agents** (Pager + Console) is meaningfully more expensive —
+  each session keeps a container hot for its lifetime, plus Opus 4.7
+  inference. A short 1-minute task is typically a few cents; a long
+  research/coding session can hit $0.50–$2. The Worker enforces a
+  per-device daily spawn cap (`PAGER_DAILY_SPAWN_CAP`, default 30) as a
+  cheap fork-bomb guard. Increase or decrease in `wrangler.toml`.
 - **Workers** free tier: 100k requests/day. **KV** free tier: 100k
   reads/day, 1k writes/day. Plenty for personal use.
 
