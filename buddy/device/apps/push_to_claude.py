@@ -47,6 +47,11 @@ DEVICE_SECRET = getattr(_cfg, "DEVICE_SECRET", "") if _cfg else ""
 WORKER_URL = _WORKER_BASE + "/ask"             # voice (raw WAV body)
 WORKER_TEXT_URL = _WORKER_BASE + "/ask-text"   # text (JSON {prompt})
 WORKER_RESET_URL = _WORKER_BASE + "/reset"     # clear server-side history
+WORKER_TTS_URL = _WORKER_BASE + "/tts"         # tts (JSON {text} -> wav)
+
+# TTS playback target on the internal flash. Capped via server-side
+# TTS_MAX_CHARS so the file stays well under the available /flash space.
+_TTS_PATH = "/flash/.tts.wav"
 # ---------------------------------------------------------------------
 
 
@@ -668,6 +673,7 @@ def _https_post_file_stream(url, file_path, headers, chunk_size=2048, timeout_s=
     return int(parts[1]), body_bytes
 
 
+
 def _post_reset():
     """Clear server-side conversation history for this device. Quick
     fire-and-forget; uses requests since the body is empty."""
@@ -758,6 +764,7 @@ def _post_recording():
 # ---- MAIN -----------------------------------------------------------
 
 def run():
+    print("p2c: run() enter")
     _set_font()
     if not _WORKER_BASE or not DEVICE_SECRET:
         _draw_error(
@@ -772,9 +779,21 @@ def run():
                 return
             time.sleep_ms(50)
     wifi_ok = _ensure_wifi()
+    print("p2c: wifi_ok=", wifi_ok)
     _draw_idle(wifi_ok)
     kb = MatrixKeyboard()
     time.sleep_ms(400)
+    # Drain any keys still in the matrix queue from the launcher's
+    # Enter press / wifi splash — without this, a stale ESC/Enter
+    # fires the first iteration of the main loop and returns instantly,
+    # which the user observes as "selected the app, saw wifi message,
+    # then back to launcher menu".
+    for _drain_i in range(25):
+        kb.tick()
+        _stale = kb.get_key()
+        if _stale is not None:
+            print("p2c: drained stale key:", repr(_stale))
+        time.sleep_ms(20)
 
     state = "idle"
     text_buf = ""
@@ -796,6 +815,7 @@ def run():
             # app, since the user might want to retry without a full
             # reboot.
             if state != "typing" and _is_exit(k):
+                print("p2c: exit via _is_exit, state=", state, "k=", repr(k))
                 return
 
             if state == "idle":
@@ -828,6 +848,13 @@ def run():
                     except OSError:
                         pass
                     gc.collect()
+                    if state == "showing" and last_response:
+                        try:
+                            import tts_helper
+                            tts_helper.play_tts(WORKER_TTS_URL, last_response, DEVICE_SECRET)
+                        except Exception as _te:
+                            print("p2c: tts skip:", _te)
+                        gc.collect()
 
                 elif _is_text_trigger(k):
                     state = "typing"
@@ -868,6 +895,13 @@ def run():
                             _draw_error(msg)
                         text_buf = ""
                         gc.collect()
+                        if state == "showing" and last_response:
+                            try:
+                                import tts_helper
+                                tts_helper.play_tts(WORKER_TTS_URL, last_response, DEVICE_SECRET)
+                            except Exception as _te:
+                                print("p2c: tts skip:", _te)
+                            gc.collect()
                 elif _is_backspace(k):
                     if text_buf:
                         text_buf = text_buf[:-1]
