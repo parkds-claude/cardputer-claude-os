@@ -37,14 +37,18 @@ export { SessionRouter } from "./router.do.js";
 // ---- Push-to-Claude (existing) -------------------------------------
 
 const CHAT_SYSTEM_PROMPT =
-  "You are Claude responding on a 240x135 pixel handheld LCD. " +
+  "You are an assistant responding on a 240x135 pixel handheld LCD. " +
   "Reply in 1-3 short sentences. Plain ASCII when possible. " +
   "No markdown, no lists, no code fences. " +
   "Be direct; assume the user can't scroll. " +
+  "Respond in the same language the user spoke or wrote in. " +
+  "If audio is provided, first transcribe the user's speech faithfully " +
+  "into the 'transcript' field, then write your reply in 'response'. " +
+  "For text input, copy the user's text into 'transcript' and answer in 'response'. " +
   "You may receive a few prior turns of conversation history; " +
   "treat the latest user message as the current question.";
 
-const CHAT_MODEL = "claude-haiku-4-5-20251001";
+const CHAT_MODEL = "gemini-2.5-flash";
 const HISTORY_MAX_MESSAGES = 8;
 const HISTORY_TTL_SECONDS = 24 * 3600;
 
@@ -79,33 +83,75 @@ async function appendTurn(env, deviceSecret, userMsg, assistantMsg) {
   });
 }
 
-async function callHaiku(env, deviceSecret, userMessage) {
-  const history = await getHistory(env, deviceSecret);
-  const messages = [...history, { role: "user", content: userMessage }];
+function bufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(
+      null,
+      bytes.subarray(i, i + CHUNK),
+    );
+  }
+  return btoa(binary);
+}
 
-  const claudeResp = await fetch("https://api.anthropic.com/v1/messages", {
+const GEMINI_RESPONSE_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    transcript: { type: "STRING" },
+    response: { type: "STRING" },
+  },
+  required: ["transcript", "response"],
+};
+
+async function callGemini(env, deviceSecret, { text, audioB64 }) {
+  const history = await getHistory(env, deviceSecret);
+  const contents = history.map((m) => ({
+    role: m.role === "assistant" ? "model" : "user",
+    parts: [{ text: m.content }],
+  }));
+
+  const userParts = audioB64
+    ? [{ inline_data: { mime_type: "audio/wav", data: audioB64 } }]
+    : [{ text }];
+  contents.push({ role: "user", parts: userParts });
+
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/${CHAT_MODEL}:generateContent` +
+    `?key=${env.GEMINI_API_KEY}`;
+
+  const resp = await fetch(url, {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
+    headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      model: CHAT_MODEL,
-      max_tokens: 250,
-      system: CHAT_SYSTEM_PROMPT,
-      messages,
+      contents,
+      systemInstruction: { parts: [{ text: CHAT_SYSTEM_PROMPT }] },
+      generationConfig: {
+        maxOutputTokens: 400,
+        responseMimeType: "application/json",
+        responseSchema: GEMINI_RESPONSE_SCHEMA,
+      },
     }),
   });
 
-  if (!claudeResp.ok) {
-    const detail = (await claudeResp.text()).slice(0, 300);
-    return { ok: false, status: claudeResp.status, detail };
+  if (!resp.ok) {
+    const detail = (await resp.text()).slice(0, 300);
+    return { ok: false, status: resp.status, detail };
   }
-  const data = await claudeResp.json();
-  const text = (data.content?.[0]?.text || "").trim() || "(empty)";
-  await appendTurn(env, deviceSecret, userMessage, text);
-  return { ok: true, text };
+  const data = await resp.json();
+  const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+  let parsed;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch {
+    parsed = { transcript: text || "", response: rawText };
+  }
+  const transcript = (parsed.transcript || text || "").trim();
+  const reply = (parsed.response || "").trim() || "(empty)";
+
+  await appendTurn(env, deviceSecret, transcript || "(audio)", reply);
+  return { ok: true, transcript, text: reply };
 }
 
 async function handleAsk(request, env) {
@@ -119,49 +165,20 @@ async function handleAsk(request, env) {
     );
   }
 
-  const form = new FormData();
-  form.append(
-    "file",
-    new Blob([audioBytes], { type: "audio/wav" }),
-    "audio.wav",
-  );
-  form.append("model", "whisper-1");
-  form.append("response_format", "text");
-
-  const whisperResp = await fetch(
-    "https://api.openai.com/v1/audio/transcriptions",
-    {
-      method: "POST",
-      headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
-      body: form,
-    },
-  );
-  if (!whisperResp.ok) {
-    const detail = (await whisperResp.text()).slice(0, 300);
-    return jsonResp(
-      { error: "whisper failed", status: whisperResp.status, detail },
-      502,
-    );
-  }
-  const transcript = (await whisperResp.text()).trim();
-  if (!transcript) {
-    return jsonResp({ transcript: "", response: "(no speech)" });
-  }
-
+  const audioB64 = bufferToBase64(audioBytes);
   const deviceSecret = request.headers.get("x-device-secret");
-  const result = await callHaiku(env, deviceSecret, transcript);
+  const result = await callGemini(env, deviceSecret, { audioB64 });
   if (!result.ok) {
     return jsonResp(
       {
-        transcript,
-        error: "claude failed",
+        error: "gemini failed",
         status: result.status,
         detail: result.detail,
       },
       502,
     );
   }
-  return jsonResp({ transcript, response: result.text });
+  return jsonResp({ transcript: result.transcript, response: result.text });
 }
 
 async function handleAskText(request, env) {
@@ -176,19 +193,22 @@ async function handleAskText(request, env) {
   if (!prompt) return jsonResp({ error: "empty prompt" }, 400);
 
   const deviceSecret = request.headers.get("x-device-secret");
-  const result = await callHaiku(env, deviceSecret, prompt);
+  const result = await callGemini(env, deviceSecret, { text: prompt });
   if (!result.ok) {
     return jsonResp(
       {
         transcript: prompt,
-        error: "claude failed",
+        error: "gemini failed",
         status: result.status,
         detail: result.detail,
       },
       502,
     );
   }
-  return jsonResp({ transcript: prompt, response: result.text });
+  return jsonResp({
+    transcript: result.transcript || prompt,
+    response: result.text,
+  });
 }
 
 async function handleReset(request, env) {
