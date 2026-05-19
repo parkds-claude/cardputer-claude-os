@@ -11,3 +11,10 @@ venv/
 buddy/device/apps/config.py
 worker/.dev.vars
 worker/.wrangler/
+
+# MicroPython bytecode (mpy-cross 산출물). source .py 만 git 추적.
+*.mpy
+
+# Worker tooling 캐시
+worker/node_modules/
+worker/package-lock.json

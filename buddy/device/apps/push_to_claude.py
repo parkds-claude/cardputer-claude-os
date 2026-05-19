@@ -48,6 +48,8 @@ WORKER_URL = _WORKER_BASE + "/ask"             # voice (raw WAV body)
 WORKER_TEXT_URL = _WORKER_BASE + "/ask-text"   # text (JSON {prompt})
 WORKER_RESET_URL = _WORKER_BASE + "/reset"     # clear server-side history
 WORKER_TTS_URL = _WORKER_BASE + "/tts"         # tts (JSON {text} -> wav)
+WORKER_MENU_URL = _WORKER_BASE + "/menu"       # briefing menu (GET)
+WORKER_PLAY_URL = _WORKER_BASE + "/play"       # briefing card play (POST)
 
 # TTS playback target on the internal flash. Capped via server-side
 # TTS_MAX_CHARS so the file stays well under the available /flash space.
@@ -149,16 +151,17 @@ def _wrap_lines(text, max_w_px, char_size=1):
 
 
 def _draw_idle(wifi_ok, status_msg=None):
-    _draw_chrome(hint="SPACE  T  N new  Q back")
-    _draw_centered("Ask Claude", 36, _CREAM, 2)
-    _draw_centered("SPACE = voice    T = text", 66, _GRAY_MID, 1)
-    _draw_centered("N = new chat (clear memory)", 82, _GRAY_MID, 1)
+    _draw_chrome(hint="SPACE  T  M menu  N new  Q")
+    _draw_centered("Ask Claude", 30, _CREAM, 2)
+    _draw_centered("SPACE = voice    T = text", 56, _GRAY_MID, 1)
+    _draw_centered("M = briefing menu", 70, _GRAY_MID, 1)
+    _draw_centered("N = new chat (clear memory)", 84, _GRAY_MID, 1)
     if status_msg:
-        _draw_centered(status_msg, 100, _GREEN, 1)
+        _draw_centered(status_msg, 102, _GREEN, 1)
     elif wifi_ok:
-        _draw_centered("WiFi: online", 100, _GREEN, 1)
+        _draw_centered("WiFi: online", 102, _GREEN, 1)
     else:
-        _draw_centered("WiFi: OFFLINE", 100, _RED, 1)
+        _draw_centered("WiFi: OFFLINE", 102, _RED, 1)
 
 
 def _draw_typing(buf, cursor_on):
@@ -235,15 +238,30 @@ def _draw_uploading(stage="thinking", detail=""):
         _draw_centered("uploading + asking Claude", 80, _GRAY_MID, 1)
 
 
+def _ascii_safe(s, fallback):
+    # The bundled DejaVu9 font has no Hangul/CJK glyphs, so any
+    # non-ASCII content renders as a row of empty boxes. We play the
+    # reply through TTS instead — on screen, swap the unrenderable
+    # text for an English placeholder so the user sees a clean state.
+    if not s:
+        return s
+    for c in s:
+        if ord(c) > 0x7E:
+            return fallback
+    return s
+
+
 def _result_layout(transcript, response):
     """Pre-wrap both halves of a result so scrolling can pick a window
     without re-wrapping every redraw. Returns (transcript_lines,
     response_lines, response_y, max_visible)."""
     _LCD.setTextSize(1)
-    t_lines = _wrap_lines("you: " + (transcript or "(silent)"), _W - 12, 1)[:2]
+    safe_t = _ascii_safe(transcript, "(voice captured)")
+    safe_r = _ascii_safe(response, "Playing reply through speaker...")
+    t_lines = _wrap_lines("you: " + (safe_t or "(silent)"), _W - 12, 1)[:2]
     response_y = 24 + len(t_lines) * 12 + 10  # +10 covers the hairline gap
     max_visible = max(1, (_H - 18 - response_y) // 12)
-    r_lines = _wrap_lines(response or "(empty)", _W - 12, 1)
+    r_lines = _wrap_lines(safe_r or "(empty)", _W - 12, 1)
     return t_lines, r_lines, response_y, max_visible
 
 
@@ -305,6 +323,83 @@ def _draw_error(msg):
         _LCD.drawString(line, 6, 46 + i * 12)
 
 
+# ---- BRIEFING MENU --------------------------------------------------
+
+# Visible rows in the menu list. DejaVu12 폰트 (≈1.3× DejaVu9) 가독성용:
+# 5 rows × 18 px = 90 px, top chrome 21 px + footer 18 px = 39 px, 화면 135 px.
+_MENU_ROW_H = 18
+_MENU_ROWS_VISIBLE = 5
+_MENU_Y0 = 24
+
+
+def _draw_menu(items, selected, scroll, now_text, jump_buf, status_msg=None):
+    """Render the briefing menu — list of cards with the selected one
+    highlighted. ``items`` is the list from GET /menu (each has key,
+    label, last_updated, stale, always_fresh). ``now_text`` is the
+    short HH:MM string painted top-right so the user knows the relay's
+    clock (the Cardputer RTC may not be set)."""
+    # 노안 가독성: 메뉴 화면만 DejaVu12 (~1.3×). 함수 종료 시 DejaVu9 복원.
+    try:
+        _LCD.setFont(_LCD.FONTS.DejaVu12)
+    except Exception:
+        pass
+    _draw_chrome(title="Briefing", hint="; . move  letter  Enter")
+    if now_text:
+        _LCD.setTextColor(_GRAY_MID, _DARK)
+        _LCD.drawString(now_text, _W - 6 - _LCD.textWidth(now_text), 5)
+
+    # Wipe content area between chrome and footer before redraw.
+    _LCD.fillRect(0, 21, _W, _H - 21 - 18, _BLACK)
+
+    if not items:
+        _draw_centered(status_msg or "(loading...)", 64, _GRAY_MID, 1)
+        _set_font()
+        return
+
+    n = len(items)
+    end = min(scroll + _MENU_ROWS_VISIBLE, n)
+    for vi, idx in enumerate(range(scroll, end)):
+        c = items[idx]
+        y = _MENU_Y0 + vi * _MENU_ROW_H
+        is_sel = (idx == selected)
+        bg = _DARK if is_sel else _BLACK
+        if is_sel:
+            _LCD.fillRect(0, y - 1, _W, _MENU_ROW_H, _DARK)
+            _LCD.setTextColor(_ORANGE, _DARK)
+            _LCD.drawString(">", 4, y)
+        label = "[{}] {}".format(c.get("key", "?"), c.get("label", ""))
+        if len(label) > 26:
+            label = label[:25] + "."
+        _LCD.setTextColor(_CREAM if is_sel else _GRAY_MID, bg)
+        _LCD.drawString(label, 14, y)
+        # Right-edge state marker.
+        if c.get("stale"):
+            _LCD.setTextColor(_RED, bg)
+            _LCD.drawString("!", _W - 14, y)
+        elif c.get("always_fresh"):
+            _LCD.setTextColor(_GREEN, bg)
+            _LCD.drawString("~", _W - 14, y)
+
+    # Scroll indicators on the right edge.
+    if scroll > 0:
+        _LCD.fillTriangle(_W - 8, _MENU_Y0, _W - 2, _MENU_Y0,
+                          _W - 5, _MENU_Y0 - 5, _ORANGE)
+    if end < n:
+        ly = _MENU_Y0 + (end - scroll - 1) * _MENU_ROW_H + 8
+        _LCD.fillTriangle(_W - 8, ly, _W - 2, ly, _W - 5, ly + 5, _ORANGE)
+
+    # Footer: jump buffer (orange) or status message (green) overrides
+    # the default hint to give the user feedback on shortcut typing.
+    if jump_buf or status_msg:
+        _LCD.fillRect(0, _H - 18, _W, 18, _DARK)
+        msg = ("jump: " + jump_buf) if jump_buf else status_msg
+        _LCD.setTextColor(_ORANGE if jump_buf else _GREEN, _DARK)
+        _LCD.drawString(msg, (_W - _LCD.textWidth(msg)) // 2, _H - 14)
+
+    # 폰트 복원 — 다른 화면(idle/typing/showing 등)은 DejaVu9 가정.
+    _set_font()
+
+
 # ---- KEY HELPERS ----------------------------------------------------
 
 def _is_exit(k):
@@ -343,6 +438,18 @@ def _is_new_chat(k):
         else:
             return False
     return isinstance(k, str) and k.lower() == "n"
+
+
+def _is_menu_trigger(k):
+    """`m` or `M` while idle → enter briefing-menu mode."""
+    if k is None:
+        return False
+    if isinstance(k, int):
+        if 0x20 <= k <= 0x7E:
+            k = chr(k)
+        else:
+            return False
+    return isinstance(k, str) and k.lower() == "m"
 
 
 def _is_text_trigger(k):
@@ -473,6 +580,40 @@ def _ensure_wifi():
         return False
 
 
+def _speaker_reinit():
+    """Force a full Speaker re-init. Cardputer's mic and speaker share
+    the same I2S bus; after M5.Mic.end() the bus is left in mic-side
+    state and a plain Speaker.begin() doesn't reclaim it cleanly —
+    symptom is "first playback works, every subsequent one is silent
+    or crackles". end() + begin() with a short gap forces the driver
+    to fully reset the I2S peripheral."""
+    try: M5.Speaker.end()
+    except Exception: pass
+    time.sleep_ms(60)
+    try: M5.Speaker.begin()
+    except Exception as e: print("p2c: spk.begin warn:", e)
+    try: M5.Speaker.setVolume(180)
+    except Exception: pass
+
+
+def _beep_start():
+    """Short tone right before mic capture begins so the user has an
+    unambiguous "start speaking now" cue. M5.Mic.begin() inside
+    _record_to_file is what flips the device from "showing the dots
+    while UI catches up" to "actually capturing samples"; without an
+    audible marker users tend to start talking too early and the
+    first syllable is lost. We stop the speaker before returning so
+    the amp is idle by the time the mic powers up."""
+    try:
+        _speaker_reinit()
+        M5.Speaker.tone(1200, 80)
+        time.sleep_ms(120)
+        try: M5.Speaker.stop()
+        except Exception: pass
+    except Exception as e:
+        print("p2c: beep err:", e)
+
+
 def _record_to_file(kb):
     """Capture audio to ``_AUDIO_PATH`` using ``M5.Mic.recordWavFile``.
 
@@ -565,7 +706,6 @@ def _record_to_file(kb):
         return 0
     # Subtract 44-byte WAV header to get sample-count estimate.
     return max(0, (size - 44) // _BYTES_PER_SAMPLE)
-    return samples_written
 
 
 def _https_post_file_stream(url, file_path, headers, chunk_size=2048, timeout_s=60):
@@ -722,6 +862,91 @@ def _post_text(prompt):
             pass
 
 
+def _get_menu():
+    """GET /menu → parsed dict {ok, now, cards}. Response is ~2 KB so
+    requests.get is fine here (no streaming needed). Raises on error."""
+    _free_internal_ram()
+    import requests
+    headers = {"x-device-secret": DEVICE_SECRET}
+    r = requests.get(WORKER_MENU_URL, headers=headers, timeout=20)
+    try:
+        if r.status_code != 200:
+            raise RuntimeError(
+                "menu {}: {}".format(r.status_code, r.text[:120]),
+            )
+        return r.json()
+    finally:
+        try:
+            r.close()
+        except Exception:
+            pass
+
+
+def _post_play_meta(key):
+    """POST /play with ``inline_audio=False`` so the response stays small
+    (a few hundred bytes). We deliberately do NOT receive audio_base64
+    inline — materializing a ~650 KB JSON body in the MicroPython heap
+    would OOM. Actual playback goes through tts_helper.play_tts which
+    streams the WAV file directly to /flash."""
+    _free_internal_ram()
+    import json as _json
+    body = _json.dumps({"key": key, "inline_audio": False}).encode()
+    gc.collect()
+    import requests
+    headers = {
+        "content-type": "application/json",
+        "x-device-secret": DEVICE_SECRET,
+    }
+    r = requests.post(WORKER_PLAY_URL, data=body, headers=headers, timeout=30)
+    try:
+        if r.status_code != 200:
+            raise RuntimeError(
+                "play {}: {}".format(r.status_code, r.text[:120]),
+            )
+        return r.json()
+    finally:
+        try:
+            r.close()
+        except Exception:
+            pass
+
+
+def _menu_fire(card_meta, kb=None):
+    """Play one briefing card end-to-end. Best-effort; never raises.
+    Returns True on a successful playback.
+
+    kb: 호출자의 MatrixKeyboard. tts_helper 가 같은 인스턴스로 cancel
+        키 폴링해야 매트릭스 큐 분기 없이 ESC/Q 잡힌다.
+    """
+    key = card_meta.get("key", "")
+    label = card_meta.get("label", "")
+    _draw_uploading("Loading", label[:30])
+    try:
+        data = _post_play_meta(key)
+    except Exception as e:
+        msg = "play err: {}".format(str(e)[:80])
+        print("p2c:", msg)
+        _draw_error(msg)
+        time.sleep_ms(1500)
+        return False
+    speak_ko = (data.get("speak_ko") or "").strip()
+    if not speak_ko:
+        _draw_uploading("(no content)", label[:30])
+        time.sleep_ms(900)
+        return False
+    _draw_uploading("Playing - ESC/Q cancel", label[:24])
+    played_ok = False
+    try:
+        import tts_helper
+        # play_tts 는 정상 완료 True / 사용자 ESC·Q 취소 False / 실패 False
+        played_ok = bool(tts_helper.play_tts(
+            WORKER_TTS_URL, speak_ko, DEVICE_SECRET, cancel_kb=kb))
+    except Exception as e:
+        print("p2c: menu tts err:", e)
+    gc.collect()
+    return played_ok
+
+
 def _post_recording():
     """Read the captured WAV and POST it. Returns the parsed JSON dict
     on success; raises on any failure (including an empty file).
@@ -804,17 +1029,27 @@ def run():
     last_transcript = ""
     last_response = ""
     scroll = 0
+    # Briefing-menu state. menu_items=None means "needs a /menu fetch
+    # on next loop iteration" — used both for initial entry and for
+    # refresh after a card finishes playing.
+    menu_items = None
+    menu_selected = 0
+    menu_scroll = 0
+    menu_now = ""
+    menu_status = None
+    jump_buf = ""
+    jump_ts = 0
 
     try:
         while True:
             kb.tick()
             k = kb.get_key()
 
-            # ESC always exits — but ONLY in non-typing states. In
-            # typing mode ESC just returns to idle without leaving the
-            # app, since the user might want to retry without a full
-            # reboot.
-            if state != "typing" and _is_exit(k):
+            # ESC always exits — but ONLY in non-typing/non-menu states.
+            # In typing mode ESC returns to idle, and in menu mode ESC
+            # returns to idle, so the user can recover from either
+            # without a full reboot.
+            if state not in ("typing", "menu") and _is_exit(k):
                 print("p2c: exit via _is_exit, state=", state, "k=", repr(k))
                 return
 
@@ -824,6 +1059,7 @@ def run():
                     gc.collect()
                     _draw_recording_initial()
                     _draw_recording_dots(0)
+                    _beep_start()
                     try:
                         _record_to_file(kb)
                     except KeyboardInterrupt:
@@ -862,6 +1098,15 @@ def run():
                     cursor_on = True
                     last_blink_ms = time.ticks_ms()
                     _draw_typing(text_buf, cursor_on)
+
+                elif _is_menu_trigger(k):
+                    state = "menu"
+                    menu_items = None
+                    menu_selected = 0
+                    menu_scroll = 0
+                    menu_status = None
+                    jump_buf = ""
+                    jump_ts = 0
 
                 elif _is_new_chat(k):
                     cleared = _post_reset()
@@ -923,6 +1168,146 @@ def run():
                         cursor_on = not cursor_on
                         last_blink_ms = now
                         _draw_typing(text_buf, cursor_on)
+
+            elif state == "menu":
+                now = time.ticks_ms()
+                # First entry (or refresh after a play): pull the card
+                # list from the server. menu_items=None is the sentinel.
+                if menu_items is None:
+                    try:
+                        data = _get_menu()
+                        menu_items = data.get("cards", []) or []
+                        ts = (data.get("now", "") or "")
+                        # ISO timestamp → "HH:MM" (positions 11..16).
+                        menu_now = ts[11:16] if len(ts) >= 16 else ""
+                    except Exception as e:
+                        print("p2c: menu fetch err:", e)
+                        menu_items = []
+                        menu_status = "menu err: " + str(e)[:24]
+                    # Keep selection within bounds after a refresh.
+                    if menu_selected >= len(menu_items):
+                        menu_selected = max(0, len(menu_items) - 1)
+                    if menu_scroll > max(0, len(menu_items) - _MENU_ROWS_VISIBLE):
+                        menu_scroll = max(0, len(menu_items) - _MENU_ROWS_VISIBLE)
+                    _draw_menu(menu_items, menu_selected, menu_scroll,
+                               menu_now, jump_buf, menu_status)
+                    time.sleep_ms(40)
+                    continue
+
+                # ESC → back to idle.
+                if k is not None and isinstance(k, int) and k == 0x1B:
+                    state = "idle"
+                    menu_items = None
+                    jump_buf = ""
+                    menu_status = None
+                    wifi_ok = _ensure_wifi()
+                    _draw_idle(wifi_ok)
+                    time.sleep_ms(40)
+                    continue
+
+                handled = False
+                if k is not None:
+                    intent = _scroll_intent(k)
+                    if intent is not None:
+                        if intent == "up" and menu_selected > 0:
+                            menu_selected -= 1
+                        elif intent == "down" and menu_selected < len(menu_items) - 1:
+                            menu_selected += 1
+                        # Keep the selected row inside the scroll window.
+                        if menu_selected < menu_scroll:
+                            menu_scroll = menu_selected
+                        elif menu_selected >= menu_scroll + _MENU_ROWS_VISIBLE:
+                            menu_scroll = menu_selected - _MENU_ROWS_VISIBLE + 1
+                        jump_buf = ""
+                        menu_status = None
+                        _draw_menu(menu_items, menu_selected, menu_scroll,
+                                   menu_now, jump_buf, menu_status)
+                        handled = True
+                    elif _is_enter(k):
+                        if menu_items:
+                            picked = menu_items[menu_selected]
+                            label = picked.get("label", "")
+                            ok = _menu_fire(picked, kb=kb)
+                            menu_items = None  # force refresh next loop
+                            jump_buf = ""
+                            menu_status = (
+                                "played: " if ok else "cancelled: "
+                            ) + label[:18]
+                        handled = True
+
+                if not handled and k is not None:
+                    ch = _printable_char(k)
+                    if ch is not None:
+                        lo = ch.lower()
+                        # Only alpha chars feed the shortcut buffer —
+                        # card keys are letter-only (mb, mr, dr, de, g, e,
+                        # t, w, wr, we). Other printables are ignored.
+                        if "a" <= lo <= "z":
+                            jump_buf = (jump_buf + lo)[-2:]
+                            jump_ts = now
+                            keys = [c.get("key", "") for c in menu_items]
+                            matches = [
+                                i for i, k0 in enumerate(keys)
+                                if k0.startswith(jump_buf)
+                            ]
+                            if matches:
+                                menu_selected = matches[0]
+                                if menu_selected < menu_scroll:
+                                    menu_scroll = menu_selected
+                                elif menu_selected >= menu_scroll + _MENU_ROWS_VISIBLE:
+                                    menu_scroll = menu_selected - _MENU_ROWS_VISIBLE + 1
+                                # Unambiguous + exact key match → fire
+                                # immediately. (Just one prefix-match
+                                # alone isn't enough: 'w' uniquely
+                                # prefixes 'wr'/'we' too, so we must
+                                # also check equality.)
+                                if len(matches) == 1 and jump_buf in keys:
+                                    picked = menu_items[menu_selected]
+                                    label = picked.get("label", "")
+                                    ok = _menu_fire(picked, kb=kb)
+                                    menu_items = None
+                                    jump_buf = ""
+                                    menu_status = (
+                                        "played: " if ok else "cancelled: "
+                                    ) + label[:18]
+                            else:
+                                # No match — try the new char alone
+                                # (user probably mistyped the first
+                                # letter and is starting over).
+                                jump_buf = lo
+                                matches = [
+                                    i for i, k0 in enumerate(keys)
+                                    if k0.startswith(jump_buf)
+                                ]
+                                if matches:
+                                    menu_selected = matches[0]
+                                else:
+                                    jump_buf = ""
+                            _draw_menu(menu_items or [], menu_selected,
+                                       menu_scroll, menu_now, jump_buf,
+                                       menu_status)
+
+                # Jump-buffer timeout: e.g. user typed 'w' (which is an
+                # exact key, but also a prefix of 'wr'/'we'). We wait
+                # 800 ms for a refinement char; if none comes, commit
+                # to the exact match.
+                if (menu_items and jump_buf
+                        and time.ticks_diff(now, jump_ts) > 800):
+                    keys = [c.get("key", "") for c in menu_items]
+                    if jump_buf in keys:
+                        idx = keys.index(jump_buf)
+                        picked = menu_items[idx]
+                        label = picked.get("label", "")
+                        ok = _menu_fire(picked, kb=kb)
+                        menu_items = None
+                        menu_status = (
+                            "played: " if ok else "cancelled: "
+                        ) + label[:18]
+                    jump_buf = ""
+                    if state == "menu":
+                        _draw_menu(menu_items or [], menu_selected,
+                                   menu_scroll, menu_now, jump_buf,
+                                   menu_status)
 
             elif state == "showing":
                 if _is_new_chat(k):
