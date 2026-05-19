@@ -129,17 +129,19 @@ def _post_recv_file(url, json_body, file_path, headers,
         except Exception: pass
 
 
-def play_tts(url, text, device_secret):
-    """Fetch TTS and play through the speaker. Best-effort; never raises."""
+def play_tts(url, text, device_secret, cancel_kb=None):
+    """Fetch TTS and play through the speaker. Best-effort; never raises.
+
+    cancel_kb: 호출자의 MatrixKeyboard 인스턴스. 전달되면 재생 중 ESC/Q
+        감지 시 즉시 stop() + return False. 매트릭스 polling 의 owner 가
+        호출자라 새 인스턴스 만들면 키 이벤트가 한쪽에만 들어와 cancel
+        놓치는 문제를 회피한다. None 이면 cancel 지원 안 함 (정상 재생).
+    """
     if not text:
         return False
     _reset_log()
     _log("tts: start text_len=", len(text))
-    try:
-        attrs = [a for a in dir(M5.Speaker) if not a.startswith("_")]
-        _log("tts: speaker attrs=", attrs)
-    except Exception as e:
-        _log("tts: dir err:", e)
+    # 매 호출마다 dir() 수집은 production 에서 노이즈 + GC 압력. 제거.
     try:
         os.remove(TTS_PATH)
     except OSError:
@@ -158,11 +160,20 @@ def play_tts(url, text, device_secret):
         _log("tts: status", status, info)
         return False
     try:
+        # Full I2S re-init. Cardputer mic & speaker share the I2S bus;
+        # after recording, a plain begin() doesn't reclaim it cleanly
+        # and we get "first playback works, the rest crackle". end()
+        # + 60 ms gap + begin() forces the driver to fully reset.
+        import time as _t
+        try: M5.Speaker.end()
+        except Exception: pass
+        _t.sleep_ms(60)
         try: M5.Speaker.begin()
         except Exception as e: _log("tts: spk.begin:", e)
-        try: M5.Speaker.setVolume(64)
+        # 255 saturates the speaker amp on Cardputer-Adv (audible
+        # crackle); 180 is the practical clipping-free max.
+        try: M5.Speaker.setVolume(180)
         except Exception as e: _log("tts: spk.vol:", e)
-        import time as _t
 
         # File size + free-heap snapshot for diagnostics.
         try:
@@ -182,6 +193,22 @@ def play_tts(url, text, device_secret):
         # FAST PATH — let the binding stream the WAV from disk so we
         # never have to materialize ~150 KB of PCM in MicroPython heap
         # (which OOMs at ~32 KB on this firmware).
+        #
+        # Speaker hygiene: M5.Speaker leaves PCM in its internal buffer
+        # after a playback completes. A naive second call overlays new
+        # samples onto that residue and the result reaches the user as
+        # noise. Bracket every playWavFile with stop() (clear residue)
+        # and poll isPlaying() to land precisely on end-of-clip rather
+        # than guessing with a fixed sleep that either cuts the tail
+        # (mechanical chirp at clip end) or returns while the buffer
+        # is still draining.
+        try: M5.Speaker.stop()
+        except Exception: pass
+        _t.sleep_ms(50)
+        # 호출자 kb 가 있으면 그것을 사용 — 새 인스턴스 만들면 매트릭스
+        # 큐가 분기되어 키 이벤트 일부가 호출자 쪽으로 가 cancel 놓침.
+        _cancel_kb = cancel_kb
+        _log("tts: cancel_kb=", _cancel_kb)
         for name in ("playWavFile", "playWav", "playWAV"):
             fn = getattr(M5.Speaker, name, None)
             if fn is None:
@@ -189,43 +216,54 @@ def play_tts(url, text, device_secret):
             try:
                 rc = fn(TTS_PATH)
                 _log("tts: called", name, "rc=", rc)
-                _t.sleep_ms(ms_estimate)
-                try:
-                    busy = M5.Speaker.isPlaying()
-                    _log("tts:", name, "isPlaying after sleep=", busy)
+                # Poll until the firmware reports playback complete,
+                # bounded by 1.5 s past the size-based estimate so a
+                # broken isPlaying() can't wedge us.
+                waited = 0
+                budget = ms_estimate + 1500
+                cancelled = False
+                while waited < budget:
+                    _t.sleep_ms(60)
+                    waited += 60
+                    try:
+                        if not M5.Speaker.isPlaying():
+                            break
+                    except Exception:
+                        pass
+                    # ESC(0x1B) 또는 'q'/'Q' → 즉시 중단
+                    if _cancel_kb is not None:
+                        try:
+                            _cancel_kb.tick()
+                            k = _cancel_kb.get_key()
+                        except Exception:
+                            k = None
+                        if k is not None:
+                            if isinstance(k, int):
+                                if 0x20 <= k <= 0x7E:
+                                    k = chr(k)
+                            is_esc = (k == 0x1B)
+                            is_q = (isinstance(k, str)
+                                    and k and k.lower() == "q")
+                            if is_esc or is_q:
+                                cancelled = True
+                                break
+                # Let the final ~150 ms of audio drain out of the DAC
+                # before we cut the amp; otherwise the last syllable
+                # is truncated mid-sample and the user hears a click.
+                if not cancelled:
+                    _t.sleep_ms(150)
+                try: M5.Speaker.stop()
                 except Exception: pass
-                return True
+                _log("tts: done", name, "waited_ms=", waited,
+                     "cancelled=", cancelled)
+                return not cancelled
             except Exception as e:
                 _log("tts:", name, "err:", e)
 
-        # SLOW PATH — only attempt if file-based call wasn't available.
-        # Free as much heap as we can first.
-        gc.collect()
-        try: _log("tts: slow-path mem_free=", gc.mem_free())
-        except Exception: pass
-        try:
-            with open(TTS_PATH, "rb") as f:
-                f.read(44)
-                pcm = f.read()
-        except Exception as e:
-            _log("tts: read err:", e)
-            return False
-        sample_count = len(pcm) // 2
-        _log("tts: pcm bytes=", len(pcm), "samples=", sample_count)
-        attempts = (
-            lambda: M5.Speaker.playRaw(pcm, sample_count, 16000, False, 1, 0),
-            lambda: M5.Speaker.playRaw(pcm, sample_count, 16000),
-            lambda: M5.Speaker.playRaw(pcm, 16000),
-            lambda: M5.Speaker.playRaw(pcm),
-        )
-        for i, fn in enumerate(attempts):
-            try:
-                fn()
-                _log("tts: playRaw OK sig", i)
-                _t.sleep_ms(ms_estimate)
-                return True
-            except Exception as e:
-                _log("tts: playRaw sig", i, "err:", e)
+        # SLOW PATH 비활성화 — 전체 PCM 을 RAM 에 적재하면 ~32KB 한도
+        # 넘어 OOM 보장. UIFlow MicroPython 빌드에는 playWavFile 이
+        # 항상 있어 이 경로는 도달 안 함. 만약 도달했다면 펌웨어 회귀.
+        _log("tts: no playWav* method available, fast-path missing — abort")
         return False
     except Exception as e:
         _log("tts: play err:", e)

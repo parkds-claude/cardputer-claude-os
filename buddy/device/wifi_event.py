@@ -17,9 +17,34 @@ is deterministic regardless of that.
 """
 
 # --- WIFI CREDENTIALS ---------------------------------------------------
-# Fill in your own. Leave empty to skip the auto-connect.
+# Fallback (NVS 미설정 시 사용). 운영 자격증명은 NVS 에 저장하고
+# 코드에는 빈 값만 둔다 (git 누출 방지). NVS 미설정 시 connect() 가
+# 'no SSID configured' err 반환하고 launcher 는 'WiFi: offline' 표시.
+# SSID/PW 입력은 디바이스에서 apps/wifi_config 앱으로 진행.
 SSID = ""
 PASSWORD = ""
+
+# NVS-first override. esp32 모듈 import 실패나 NVS 미존재 시 조용히 fallback.
+try:
+    import esp32 as _esp32
+
+    _nvs = _esp32.NVS("buddy")
+    _buf = bytearray(128)
+    try:
+        _n = _nvs.get_blob("ssid", _buf)
+        _v = bytes(_buf[:_n]).decode("utf-8")
+        if _v:
+            SSID = _v
+    except Exception:
+        pass
+    try:
+        _n = _nvs.get_blob("pswd", _buf)
+        # 빈 문자열도 허용 (open network).
+        PASSWORD = bytes(_buf[:_n]).decode("utf-8")
+    except Exception:
+        pass
+except Exception:
+    pass
 # -----------------------------------------------------------------------
 
 # How long to wait for an IP before giving up. The venue network is
