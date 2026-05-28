@@ -645,17 +645,15 @@ def _record_to_file(kb):
 
         # Kick off the recording. recordWavFile is async — it returns
         # immediately and isRecording() reports completion.
+        # NOTE: firmware interprets (path, duration, rate) NOT (path, rate, duration).
+        # Passing (path, _RATE=16000, _MAX_SECONDS=6) wrote rate=6 Hz in the
+        # WAV header because the firmware read the 2nd arg as duration and the
+        # 3rd as sample_rate. Correct order is (path, duration_s, sample_rate).
         try:
-            M5.Mic.recordWavFile(_AUDIO_PATH, _RATE, _MAX_SECONDS)
-        except TypeError:
-            # Fallback signature variants if the firmware uses a
-            # different ordering. Empirically (path, rate, sec) is
-            # what works on our build, but be defensive.
-            try:
-                M5.Mic.recordWavFile(_AUDIO_PATH, _MAX_SECONDS, _RATE)
-            except Exception as e:
-                print("p2c: recordWavFile err:", e)
-                return 0
+            M5.Mic.recordWavFile(_AUDIO_PATH, _MAX_SECONDS, _RATE)
+        except Exception as e:
+            print("p2c: recordWavFile err:", e)
+            return 0
 
         # Drive the LCD heartbeat while the firmware records. Poll
         # isRecording every ~120 ms; bail if it runs long over the
